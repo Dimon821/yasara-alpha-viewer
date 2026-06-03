@@ -29,12 +29,9 @@ except ImportError:
     yasaramodule = None
 
 # =========================================================
-# CONFIGURATION & GLOBAL STATE
+# CONFIGURATION & GLOBAL STATE (Dataset hardcoding removed)
 # =========================================================
-cfg = {
-    "dataset_dir": r"C:\Users\swage\Downloads\Tyrosine-protein phosphatase non-receptor type substrate 1"
-}
-
+current_dataset_dir = None
 current_cif_path = None
 current_json_path = None
 plddt_data = None
@@ -198,7 +195,6 @@ def push_colors_to_yasara_isolated(color_groups, target_residues=None):
     
     try:
         if target_residues is not None and len(target_residues) < len(plddt_data):
-            # Clean out the rest of the structural frame by flashing to white first
             yasaramodule.run("ColorRes Res All, White")
             push_colors_to_yasara(color_groups)
         else:
@@ -291,7 +287,6 @@ def on_canvas_click(event):
         pae_line_h.set_ydata([event.ydata, event.ydata])
         pae_line_v.set_xdata([event.xdata, event.xdata])
         
-        # If user clicks the PAE matrix, auto-switch view mode back to PAE 
         if current_view_mode != "pae":
             current_view_mode = "pae"
             btn1.label.set_text("Mode: PAE")
@@ -303,10 +298,7 @@ def on_canvas_click(event):
     fig.canvas.draw_idle()
 
 
-# HIGH-PERFORMANCE ZOOM ACTION HANDLER
-# ---------------------------------------------------------
 def trigger_zoom_highlight(event=None):
-    """Reads current plot scale, blanks out-of-zoom sequences, and focuses the YASARA view."""
     if plddt_data is None or yasaramodule is None: 
         return
         
@@ -373,20 +365,26 @@ def reset_model():
             print(f"Could not interact with or launch YASARA window binary: {hardware_error}")
 
 
-def handle_change_dataset(event):
-    global current_cif_path, current_json_path, plddt_data, pae_data
-    print("\nOpening folder prompt...")
-    
+def select_dataset_dialog():
+    """Brings up a completely clean Tkinter prompt at the system default location"""
+    print("Opening data folder selector...")
     root = Tk()
     root.withdraw()
     root.attributes('-topmost', True) 
     
+    # Passing an empty initialdir forces the OS to open its clean, default profile directory
     chosen_dir = filedialog.askdirectory(
-        initialdir=os.path.dirname(cfg["dataset_dir"]),
+        initialdir="", 
         title="Select AlphaFold Protein Dataset Directory"
     )
     root.destroy()
+    return chosen_dir
+
+
+def handle_change_dataset(event):
+    global current_cif_path, current_json_path, plddt_data, pae_data, current_dataset_dir
     
+    chosen_dir = select_dataset_dialog()
     if not chosen_dir:
         print("Dataset swapping canceled.")
         return
@@ -400,7 +398,7 @@ def handle_change_dataset(event):
         current_json_path = new_json
         plddt_data = new_plddt
         pae_data = new_pae
-        cfg["dataset_dir"] = chosen_dir
+        current_dataset_dir = chosen_dir
         
         render_plots()
         reset_model()
@@ -450,8 +448,19 @@ fig.canvas.mpl_connect('button_press_event', on_canvas_click)
 if __name__ == "__main__":
     print(f"Current Matplotlib Backend: {matplotlib.get_backend()}")
     
-    current_cif_path, current_json_path = load_from_directory(cfg["dataset_dir"])
-    plddt_data, pae_data = parse_alphafold_json(current_json_path, current_cif_path)
+    # Prompt user for data immediately on boot-up 
+    while not current_dataset_dir:
+        current_dataset_dir = select_dataset_dialog()
+        if not current_dataset_dir:
+            print("No folder selected. You must pick an AlphaFold target folder to start.")
+            sys.exit(0)
+            
+    try:
+        current_cif_path, current_json_path = load_from_directory(current_dataset_dir)
+        plddt_data, pae_data = parse_alphafold_json(current_json_path, current_cif_path)
+    except Exception as initialization_error:
+        print(f"Error parsing your chosen directory: {initialization_error}")
+        sys.exit(0)
     
     print("Initializing layout canvases...")
     render_plots()
