@@ -191,44 +191,56 @@ def push_colors_to_yasara(color_groups):
             print(f"YASARA Color Mapping Communication error: {e}")
 
 
-def apply_plddt_view():
-    global current_view_mode
-    current_view_mode = "plddt"
-    print("Applying pLDDT Confidence Structural View...")
+def push_colors_to_yasara_isolated(color_groups, target_residues=None):
+    """Pushes colors and cleanly isolates zoomed segments from the rest of the protein"""
+    if yasaramodule is None: 
+        return
     
+    try:
+        if target_residues is not None and len(target_residues) < len(plddt_data):
+            # Clean out the rest of the structural frame by flashing to white first
+            yasaramodule.run("ColorRes Res All, White")
+            push_colors_to_yasara(color_groups)
+        else:
+            push_colors_to_yasara(color_groups)
+    except Exception as e:
+        print(f"Error isolating YASARA colors: {e}")
+
+
+def apply_plddt_view(target_residues=None):
+    """Applies pLDDT colors. Optional 'target_residues' list forces coloring on specific indices only."""
     groups = {"Red": [], "Yellow": [], "Cyan": [], "Blue": []}
     for res_idx, score in enumerate(plddt_data):
         res_num = res_idx + 1
+        if target_residues is not None and res_num not in target_residues:
+            continue
+            
         if score < 50: groups["Red"].append(res_num)
         elif score < 70: groups["Yellow"].append(res_num)
         elif score < 90: groups["Cyan"].append(res_num)
         else: groups["Blue"].append(res_num)
         
-    push_colors_to_yasara(groups)
+    push_colors_to_yasara_isolated(groups, target_residues)
 
 
-def apply_pae_view(focus_res):
-    global current_view_mode, current_pae_focus_residue
-    current_view_mode = "pae"
-    current_pae_focus_residue = focus_res
-    
-    # Bound check the index array space
+def apply_pae_view(focus_res, target_residues=None):
+    """Applies PAE colors. Optional 'target_residues' list forces coloring on specific indices only."""
     idx = max(0, min(focus_res - 1, pae_data.shape[0] - 1))
-    print(f"Applying PAE Alignment View relative to Focus Residue: {idx + 1}")
-    
-    # Extract the 1D error profile array slice 
     error_slice = pae_data[idx]
     
     groups = {"DarkGreen": [], "Green": [], "Yellow": [], "Orange": [], "Red": []}
     for res_idx, error in enumerate(error_slice):
         res_num = res_idx + 1
+        if target_residues is not None and res_num not in target_residues:
+            continue
+            
         if error <= 5.0: groups["DarkGreen"].append(res_num)
         elif error <= 10.0: groups["Green"].append(res_num)
         elif error <= 15.0: groups["Yellow"].append(res_num)
         elif error <= 25.0: groups["Orange"].append(res_num)
         else: groups["Red"].append(res_num)
         
-    push_colors_to_yasara(groups)
+    push_colors_to_yasara_isolated(groups, target_residues)
 
 # =========================================================
 # GRAPHICS ENGINE & CONTROLS
@@ -236,7 +248,6 @@ def apply_pae_view(focus_res):
 fig, (ax_pae, ax_plddt) = plt.subplots(2, 1, figsize=(7, 8))
 fig.subplots_adjust(hspace=0.6, bottom=0.15)
 
-# Track optional horizontal selection overlay lines on the canvas plots
 pae_line_h = None
 pae_line_v = None
 
@@ -245,19 +256,16 @@ def render_plots():
     ax_pae.clear()
     ax_plddt.clear()
     
-    # 1. PAE Matrix Panel
     ax_pae.imshow(pae_data, cmap='Blues_r', vmin=0, vmax=30, aspect='equal')
     protein_name = os.path.basename(os.path.dirname(current_cif_path))
     ax_pae.set_title(f"PAE Matrix: {protein_name}\n(Click anywhere to map errors relative to that residue)", pad=12, fontsize=10, weight='bold')
     ax_pae.set_xlabel("Scored Residue", labelpad=8)
     ax_pae.set_ylabel("Predicted Residue", labelpad=8)
     
-    # Render indicators at selection intersection
     focus_idx = current_pae_focus_residue - 1
     pae_line_h = ax_pae.axhline(focus_idx, color='magenta', linestyle='--', alpha=0.7, visible=(current_view_mode == "pae"))
     pae_line_v = ax_pae.axvline(focus_idx, color='magenta', linestyle='--', alpha=0.7, visible=(current_view_mode == "pae"))
     
-    # 2. pLDDT Confidence Profile Panel
     residues = np.arange(1, len(plddt_data) + 1)
     ax_plddt.plot(residues, plddt_data, color='#1f77b4', linewidth=1.5)
     ax_plddt.set_title("pLDDT Confidence Profile", pad=12)
@@ -272,22 +280,70 @@ def render_plots():
 
 
 def on_canvas_click(event):
-    """Intercept clicks on the upper PAE matrix plot to change structure views"""
     if event.inaxes != ax_pae or event.xdata is None or event.ydata is None:
         return
         
-    # Get the residue index that was clicked
+    global current_pae_focus_residue, current_view_mode
     clicked_residue = int(round(event.xdata)) + 1
+    current_pae_focus_residue = clicked_residue
     
-    # Adjust indicator state
     if pae_line_h and pae_line_v:
         pae_line_h.set_ydata([event.ydata, event.ydata])
         pae_line_v.set_xdata([event.xdata, event.xdata])
+        
+        # If user clicks the PAE matrix, auto-switch view mode back to PAE 
+        if current_view_mode != "pae":
+            current_view_mode = "pae"
+            btn1.label.set_text("Mode: PAE")
+            
         pae_line_h.set_visible(True)
         pae_line_v.set_visible(True)
         
     apply_pae_view(clicked_residue)
     fig.canvas.draw_idle()
+
+
+# HIGH-PERFORMANCE ZOOM ACTION HANDLER
+# ---------------------------------------------------------
+def trigger_zoom_highlight(event=None):
+    """Reads current plot scale, blanks out-of-zoom sequences, and focuses the YASARA view."""
+    if plddt_data is None or yasaramodule is None: 
+        return
+        
+    ax_target = ax_plddt if current_view_mode == "plddt" else ax_pae
+    x_min, x_max = ax_target.get_xlim()
+    
+    if x_min > x_max:
+        x_min, x_max = x_max, x_min
+
+    res_start = max(1, int(np.floor(x_min)))
+    res_end = min(len(plddt_data), int(np.ceil(x_max)))
+    visible_count = res_end - res_start + 1
+    
+    if visible_count < (len(plddt_data) - 5) and visible_count > 1:
+        print(f"Isolating focus [Mode: {current_view_mode}] onto residues {res_start} to {res_end}")
+        visible_residues = set(range(res_start, res_end + 1))
+        range_string = f"{res_start}-{res_end}"
+        
+        if current_view_mode == "plddt":
+            apply_plddt_view(target_residues=visible_residues)
+        else:
+            apply_pae_view(current_pae_focus_residue, target_residues=visible_residues)
+            
+        try:
+            yasaramodule.run(f"ZoomRes Res {range_string}, Steps=12")
+        except Exception as e:
+            print(f"YASARA viewport shift error: {e}")
+    else:
+        print("Zoom scale full or reset. Restoring global protein overview...")
+        if current_view_mode == "plddt":
+            apply_plddt_view()
+        else:
+            apply_pae_view(current_pae_focus_residue)
+        try:
+            yasaramodule.run("ZoomAll, Steps=12")
+        except:
+            pass
 
 
 def reset_model():
@@ -356,19 +412,36 @@ def handle_change_dataset(event):
 # MATPLOTLIB WIDGET INTERACTION INTERFACES
 # =========================================================
 ax_btn1 = fig.add_axes([0.15, 0.03, 0.2, 0.05])
-ax_btn2 = fig.add_axes([0.40, 0.03, 0.2, 0.05])
+ax_btn2 = fig.add_axes([0.40, 0.03, 0.2, 0.05]) 
 ax_btn3 = fig.add_axes([0.65, 0.03, 0.2, 0.05])
 
-btn1 = Button(ax_btn1, 'pLDDT View')
-btn2 = Button(ax_btn2, 'PAE View (Default)')
+btn1 = Button(ax_btn1, 'Mode: pLDDT')
+btn2 = Button(ax_btn2, 'Highlight Zoomed')  
 btn3 = Button(ax_btn3, 'Change Dataset')
 
-# Connect interaction handlers
-btn1.on_clicked(lambda event: [apply_plddt_view(), pae_line_h.set_visible(False) if pae_line_h else None, pae_line_v.set_visible(False) if pae_line_v else None, fig.canvas.draw_idle()])
-btn2.on_clicked(lambda event: [apply_pae_view(current_pae_focus_residue), pae_line_h.set_visible(True) if pae_line_h else None, pae_line_v.set_visible(True) if pae_line_v else None, fig.canvas.draw_idle()])
+def handle_mode_toggle(event):
+    global current_view_mode
+    if current_view_mode == "plddt":
+        current_view_mode = "pae"
+        btn1.label.set_text("Mode: PAE")
+        if pae_line_h and pae_line_v:
+            pae_line_h.set_visible(True)
+            pae_line_v.set_visible(True)
+        apply_pae_view(current_pae_focus_residue)
+    else:
+        current_view_mode = "plddt"
+        btn1.label.set_text("Mode: pLDDT")
+        if pae_line_h and pae_line_v:
+            pae_line_h.set_visible(False)
+            pae_line_v.set_visible(False)
+        apply_plddt_view()
+        
+    fig.canvas.draw_idle()
+
+btn1.on_clicked(handle_mode_toggle)
+btn2.on_clicked(trigger_zoom_highlight)      
 btn3.on_clicked(handle_change_dataset) 
 
-# Bind mouse click listener event directly onto the Matplotlib window canvas
 fig.canvas.mpl_connect('button_press_event', on_canvas_click)
 
 # =========================================================
