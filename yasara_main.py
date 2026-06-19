@@ -2,10 +2,10 @@ import os
 import json
 import numpy as np
 
-# Import YASARA module (must be run within YASARA or with yasara module in PYTHONPATH)
-import yasara_main
+# Import PyMOL API
+from pymol import cmd
 
-# Dynamically handle PyQt/PySide depending on what environment YASARA is using
+# Dynamically handle PyQt/PySide depending on environment
 try:
     from PyQt5 import QtWidgets, QtCore
     import matplotlib
@@ -22,14 +22,16 @@ from matplotlib.figure import Figure
 # Global reference to prevent the garbage collector from destroying the window
 alpha_viewer_instance = None
 
-class YasaraAlphaFoldViewer(QtWidgets.QDialog):
+class PyMOLAlphaFoldViewer(QtWidgets.QDialog):
     def __init__(self, parent=None):
-        super(YasaraAlphaFoldViewer, self).__init__(parent)
-        self.setWindowTitle("YASARA AlphaFold PAE & pLDDT Viewer")
-        self.resize(800, 700)
+        super(PyMOLAlphaFoldViewer, self).__init__(parent)
+        self.setWindowTitle("PyMOL AlphaFold PAE & pLDDT Analyzer")
+        self.resize(1000, 600)
         
         self.current_dataset_dir = None
         self.pae_data = None
+        self.plddt_data = None
+        self.colorbar = None  
         
         # --- UI Layout ---
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -45,15 +47,18 @@ class YasaraAlphaFoldViewer(QtWidgets.QDialog):
         btn_layout.addWidget(self.btn2)
         main_layout.addLayout(btn_layout)
         
-        # Matplotlib Canvas Setup
+        # Matplotlib Canvas Setup (Dual Plot Layout)
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
         main_layout.addWidget(self.canvas)
         
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("Predicted Aligned Error (PAE)")
-        self.ax.set_xlabel("Scored residue")
-        self.ax.set_ylabel("Aligned residue")
+        # Left Subplot: PAE Heatmap
+        self.ax_pae = self.figure.add_subplot(121)
+        self.setup_pae_axes()
+        
+        # Right Subplot: pLDDT Line Graph
+        self.ax_plddt = self.figure.add_subplot(122)
+        self.setup_plddt_axes()
         
         # --- Callbacks & Connections ---
         self.btn1.clicked.connect(self.handle_mode_toggle)
@@ -61,35 +66,63 @@ class YasaraAlphaFoldViewer(QtWidgets.QDialog):
         self.btn3.clicked.connect(self.handle_change_dataset)
         self.canvas.mpl_connect('button_press_event', self.on_canvas_click)
 
+    def setup_pae_axes(self):
+        """Initializes labels for the PAE matrix."""
+        self.ax_pae.set_title("Predicted Aligned Error (PAE)")
+        self.ax_pae.set_xlabel("Scored residue")
+        self.ax_pae.set_ylabel("Aligned residue")
+
+    def setup_plddt_axes(self):
+        """Initializes labels for the pLDDT chart."""
+        self.ax_plddt.set_title("Model Confidence (pLDDT)")
+        self.ax_plddt.set_xlabel("Residue position")
+        self.ax_plddt.set_ylabel("pLDDT Score")
+        self.ax_plddt.set_ylim(0, 105)
+        self.ax_plddt.grid(True, linestyle='--', alpha=0.5)
+
     def select_dataset_dialog(self):
         """Opens a folder picker to select the dataset directory."""
         dir_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select AlphaFold Output Folder")
         return dir_path
 
     def parse_alphafold_json(self, json_path):
-        """Safely parses PAE data from standard AlphaFold or ColabFold JSON formats."""
+        """Safely extracts both PAE and pLDDT data from AlphaFold/ColabFold JSON variants."""
         with open(json_path, 'r') as f:
             data = json.load(f)
             
         if isinstance(data, list):
             data = data[0]
             
+        print("Found JSON keys:", data.keys() if isinstance(data, dict) else "List format")
+            
+        # Try finding the 2D PAE matrix
         pae = data.get('pae') or data.get('predicted_aligned_error') or data.get('distance')
+        # Try finding the 1D pLDDT sequence
+        plddt = data.get('plddt') or data.get('pLDDT') or data.get('atom_plddts')
         
-        if pae is not None:
-            return np.array(pae)
-        return None
+        return (np.array(pae) if pae is not None else None, 
+                np.array(plddt) if plddt is not None else None)
 
     def reset_model(self):
-        """Clears the YASARA workspace and resets the Matplotlib plot."""
-        yasara_main.run("Clear")
-        self.ax.clear()
-        self.ax.set_title("Predicted Aligned Error (PAE)")
+        """Clears PyMOL workspace and flushes both Matplotlib plots."""
+        cmd.reinitialize()
+        
+        self.ax_pae.clear()
+        self.ax_plddt.clear()
+        
+        if self.colorbar:
+            self.colorbar.remove()
+            self.colorbar = None
+            
+        self.setup_pae_axes()
+        self.setup_plddt_axes()
         self.canvas.draw()
+        
         self.pae_data = None
+        self.plddt_data = None
 
     def handle_change_dataset(self):
-        """Handles loading a new PDB/CIF and its corresponding PAE JSON into YASARA."""
+        """Loads structural models and syncs analytics dashboards inside PyMOL."""
         dir_path = self.select_dataset_dialog()
         if not dir_path:
             return
@@ -103,66 +136,108 @@ class YasaraAlphaFoldViewer(QtWidgets.QDialog):
             return
 
         struct_file = next((f for f in files if f.endswith(".pdb") or f.endswith(".cif")), None)
-        json_file = next((f for f in files if f.endswith(".json") and ("pae" in f.lower() or "scores" in f.lower() or "rank" in f.lower())), None)
+        # Prioritize rich data files (like full_data files) if available
+        json_file = next((f for f in files if f.endswith(".json") and ("full_data" in f.lower() or "pae" in f.lower() or "scores" in f.lower() or "rank" in f.lower())), None)
         
         if struct_file and json_file:
             struct_path = os.path.join(dir_path, struct_file).replace("\\", "/")
             json_path = os.path.join(dir_path, json_file)
             
-            # Load structure into YASARA and set visual style
-            yasara_main.run(f'LoadPDB "{struct_path}"')
-            yasara_main.run('Style Ribbon')
-            yasara_main.run('CenterAll')
+            # Load into PyMOL
+            cmd.load(struct_path, "target_model")
+            cmd.show_as("cartoon", "target_model")
+            cmd.zoom("target_model")
             
-            # Parse and plot the PAE matrix
-            self.pae_data = self.parse_alphafold_json(json_path)
+            # Extract Metrics
+            self.pae_data, self.plddt_data = self.parse_alphafold_json(json_path)
+            
+            # 1. Render PAE Plot (if available)
             if self.pae_data is not None:
-                cax = self.ax.imshow(self.pae_data, cmap='bwr', vmin=0, vmax=30)
-                self.figure.colorbar(cax, ax=self.ax, label="Expected Position Error (Å)")
-                self.canvas.draw()
+                N = self.pae_data.shape[0]
+                # Extent ensures axes directly match 1-indexed residue IDs
+                cax = self.ax_pae.imshow(self.pae_data, cmap='bwr_r', vmin=0, vmax=30, extent=[0.5, N + 0.5, N + 0.5, 0.5])
+                self.colorbar = self.figure.colorbar(cax, ax=self.ax_pae, label="Expected Position Error (Å)")
             else:
-                print("Warning: Could not find a recognizable PAE array in the provided JSON.")
+                print("Warning: Missing or unreadable PAE matrix inside selected JSON.")
+                
+            # 2. Render pLDDT Plot (if available)
+            if self.plddt_data is not None:
+                residue_indices = np.arange(1, len(self.plddt_data) + 1)
+                self.ax_plddt.plot(residue_indices, self.plddt_data, color='#1f77b4', linewidth=2)
+                # Draw cutoff lines indicating standard AlphaFold confidence boundaries
+                self.ax_plddt.axhline(90, color='darkblue', linestyle=':', alpha=0.5, label='Very High (>90)')
+                self.ax_plddt.axhline(70, color='lightblue', linestyle=':', alpha=0.5, label='Confident (>70)')
+                self.ax_plddt.axhline(50, color='orange', linestyle=':', alpha=0.5, label='Low (>50)')
+            else:
+                print("Warning: Missing or unreadable pLDDT metrics inside selected JSON.")
+
+            self.figure.tight_layout()
+            self.canvas.draw()
         else:
-            QtWidgets.QMessageBox.warning(self, "Files Missing", "Could not locate both a structure file (.pdb/.cif) and a PAE JSON file in the selected directory.")
+            QtWidgets.QMessageBox.warning(self, "Files Missing", "Could not locate matching structures (.pdb/.cif) and metric registries (.json).")
 
     def handle_mode_toggle(self):
-        """Colors the model by pLDDT using YASARA's B-factor coloring."""
-        # AlphaFold puts pLDDT in the B-factor column. YASARA can color by B-factor directly.
-        yasara_main.run("ColorRes all, BFactor")
-        print("Model colored by pLDDT (B-factor).")
+        """Applies iconic AlphaFold rainbow color standards utilizing structural B-Factors."""
+        # AlphaFold maps overall accuracy metrics directly to the atom B-Factor indices
+        cmd.color("red", "target_model and b < 50")
+        cmd.color("orange", "target_model and b >= 50 and b < 70")
+        cmd.color("lightblue", "target_model and b >= 70 and b < 90")
+        cmd.color("darkblue", "target_model and b >= 90")
+        print("Model standard alpha-color scale applied via B-Factors.")
 
     def reset_view(self):
-        """Centers the view on the whole molecule and hides sidechains."""
-        yasara_main.run("HideAtom Sidechain")
-        yasara_main.run("CenterAll")
-        yasara_main.run("ZoomAll")
-        print("View reset.")
+        """Cleans selections, masks sidechains, and focuses back to whole-molecule view."""
+        cmd.delete("click_highlight")
+        cmd.hide("sticks")
+        cmd.show("cartoon", "target_model")
+        cmd.zoom("all")
+        print("PyMOL frame and layouts reset.")
 
     def on_canvas_click(self, event):
-        """Translates a click on the PAE heatmap into a YASARA selection & zoom."""
-        if event.inaxes != self.ax or self.pae_data is None:
+        """Routes viewport clicks dynamically based on which plot environment is selected."""
+        if event.inaxes is None:
             return
         if event.xdata is None or event.ydata is None:
             return
+
+        # Clear out any prior interactive selection highlights
+        cmd.delete("click_highlight")
+
+        # --- CASE A: User interacted with the PAE Heatmap ---
+        if event.inaxes == self.ax_pae:
+            if self.pae_data is None: return
+            res1 = int(round(event.xdata))
+            res2 = int(round(event.ydata))
             
-        res1 = int(round(event.xdata)) + 1
-        res2 = int(round(event.ydata)) + 1
-        
-        # Show sidechains, color them, and zoom in YASARA
-        yasara_main.run(f"ShowAtom Res {res1} {res2} and Sidechain")
-        yasara_main.run(f"ColorRes {res1} {res2}, Magenta")
-        yasara_main.run(f"ZoomRes {res1} {res2}")
-        
-        print(f"Highlighted cross-residue interaction in YASARA: Residue {res1} and Residue {res2}")
+            print(f"PAE Heatmap Hit: Analyzing Inter-domain error between Residue {res1} and {res2}")
+            
+            # Select both residue targets
+            cmd.select("click_highlight", f"target_model and (resi {res1} or resi {res2})")
+            cmd.show("sticks", "click_highlight")
+            cmd.color("magenta", "click_highlight")
+            cmd.zoom("click_highlight", buffer=6.0)
+
+        # --- CASE B: User interacted with the pLDDT Graph ---
+        elif event.inaxes == self.ax_plddt:
+            if self.plddt_data is None: return
+            res = int(round(event.xdata))
+            score = event.ydata
+            
+            print(f"pLDDT Trace Hit: Isolating position {res} (Local confidence score: {score:.1f})")
+            
+            # Select single target position
+            cmd.select("click_highlight", f"target_model and resi {res}")
+            cmd.show("sticks", "click_highlight")
+            cmd.color("magenta", "click_highlight")
+            cmd.zoom("click_highlight", buffer=6.0)
 
 def start_alpha_viewer():
     global alpha_viewer_instance
     if alpha_viewer_instance is None:
-        alpha_viewer_instance = YasaraAlphaFoldViewer()
+        alpha_viewer_instance = PyMOLAlphaFoldViewer()
         
     alpha_viewer_instance.show()
     alpha_viewer_instance.raise_()
 
-# If running directly inside YASARA's python console
 if __name__ == '__main__':
     start_alpha_viewer()
